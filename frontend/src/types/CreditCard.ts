@@ -1,5 +1,4 @@
 export interface CreditCard {
-	number: string;
-	expiration: string;
-	cvv?: string;
+  number: string
+  expiration: string
 }

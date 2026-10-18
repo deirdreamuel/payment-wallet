@@ -14,6 +14,8 @@ export interface StaticSiteProps {
 	domainName: string;
 	subdomainName: string;
 	filePath: string;
+	/** Origin(s) allowed in CSP connect-src, e.g. API Gateway URL */
+	apiConnectSrc?: string[];
 }
 
 /**
@@ -34,27 +36,15 @@ export class StaticSite extends Construct {
 
 		new CfnOutput(this, 'Site', { value: `https://${siteDomain}` });
 
-		// Content bucket
 		const siteBucket = new s3.Bucket(this, 'SiteBucket', {
 			bucketName: siteDomain,
 			publicReadAccess: false,
 			blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
-
-			/**
-			 * The default removal policy is RETAIN, which means that cdk destroy will not attempt to delete
-			 * the new bucket, and it will remain in your account until manually deleted. By setting the policy to
-			 * DESTROY, cdk destroy will attempt to delete the bucket, but will error if the bucket is not empty.
-			 */
-			removalPolicy: RemovalPolicy.DESTROY, // NOT recommended for production code
-
-			/**
-			 * For sample purposes only, if you create an S3 bucket then populate it, stack destruction fails.  This
-			 * setting will enable full cleanup of the demo.
-			 */
-			autoDeleteObjects: true // NOT recommended for production code
+			removalPolicy: RemovalPolicy.RETAIN,
+			autoDeleteObjects: false,
+			enforceSSL: true
 		});
 
-		// Grant access to cloudfront
 		siteBucket.addToResourcePolicy(
 			new iam.PolicyStatement({
 				actions: ['s3:GetObject'],
@@ -68,7 +58,6 @@ export class StaticSite extends Construct {
 		);
 		new CfnOutput(this, 'Bucket', { value: siteBucket.bucketName });
 
-		// TLS certificate
 		const certificate = new acm.Certificate(this, 'SiteCertificate', {
 			domainName: siteDomain,
 			validation: acm.CertificateValidation.fromDns(zone)
@@ -76,7 +65,67 @@ export class StaticSite extends Construct {
 
 		new CfnOutput(this, 'Certificate', { value: certificate.certificateArn });
 
-		// CloudFront distribution
+		const apiConnect = (props.apiConnectSrc ?? []).join(' ');
+		const csp = [
+			"default-src 'self'",
+			"base-uri 'self'",
+			"object-src 'none'",
+			"frame-ancestors 'none'",
+			"form-action 'self'",
+			"img-src 'self' data: https://*.googleusercontent.com",
+			"font-src 'self' https://fonts.gstatic.com",
+			"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+			"script-src 'self' https://accounts.google.com",
+			"frame-src https://accounts.google.com",
+			`connect-src 'self' https://accounts.google.com https://oauth2.googleapis.com https://www.googleapis.com${
+				apiConnect ? ` ${apiConnect}` : ''
+			}`,
+			'upgrade-insecure-requests'
+		].join('; ');
+
+		const responseHeadersPolicy = new cloudfront.ResponseHeadersPolicy(
+			this,
+			'SecurityHeadersPolicy',
+			{
+				comment: `Security headers for ${siteDomain}`,
+				securityHeadersBehavior: {
+					contentSecurityPolicy: {
+						contentSecurityPolicy: csp,
+						override: true
+					},
+					contentTypeOptions: { override: true },
+					frameOptions: {
+						frameOption: cloudfront.HeadersFrameOption.DENY,
+						override: true
+					},
+					referrerPolicy: {
+						referrerPolicy: cloudfront.HeadersReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN,
+						override: true
+					},
+					strictTransportSecurity: {
+						accessControlMaxAge: Duration.days(365),
+						includeSubdomains: true,
+						preload: true,
+						override: true
+					},
+					xssProtection: {
+						protection: true,
+						modeBlock: true,
+						override: true
+					}
+				},
+				customHeadersBehavior: {
+					customHeaders: [
+						{
+							header: 'Permissions-Policy',
+							value: 'camera=(), microphone=(), geolocation=(), payment=()',
+							override: true
+						}
+					]
+				}
+			}
+		);
+
 		const distribution = new cloudfront.Distribution(this, 'SiteDistribution', {
 			certificate: certificate,
 			defaultRootObject: 'index.html',
@@ -87,7 +136,13 @@ export class StaticSite extends Construct {
 					httpStatus: 403,
 					responseHttpStatus: 200,
 					responsePagePath: '/index.html',
-					ttl: Duration.minutes(30)
+					ttl: Duration.minutes(5)
+				},
+				{
+					httpStatus: 404,
+					responseHttpStatus: 200,
+					responsePagePath: '/index.html',
+					ttl: Duration.minutes(5)
 				}
 			],
 			defaultBehavior: {
@@ -96,20 +151,19 @@ export class StaticSite extends Construct {
 				}),
 				compress: true,
 				allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD_OPTIONS,
-				viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS
+				viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+				responseHeadersPolicy
 			}
 		});
 
 		new CfnOutput(this, 'DistributionId', { value: distribution.distributionId });
 
-		// Route53 alias record for the CloudFront distribution
 		new route53.ARecord(this, 'SiteAliasRecord', {
 			recordName: siteDomain,
 			target: route53.RecordTarget.fromAlias(new targets.CloudFrontTarget(distribution)),
 			zone
 		});
 
-		// Deploy site contents to S3 bucket
 		new s3deploy.BucketDeployment(this, 'DeployWithInvalidation', {
 			sources: [s3deploy.Source.asset(props.filePath)],
 			destinationBucket: siteBucket,
